@@ -1,5 +1,5 @@
-torch>=2.0.0
+torch>=2.6.0
 transformers>=4.57.3
 huggingface_hub>=0.21.4
-sentencepiece
-tqdm
+sentencepiece>=0.2.1
+tqdm>=4.66.3
