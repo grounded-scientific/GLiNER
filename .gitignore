@@ -181,3 +181,5 @@ poetry.toml
 pyrightconfig.json
 
 .vscode
+# RubberDuck audit output
+rubberduck-*/
