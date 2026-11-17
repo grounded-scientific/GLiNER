@@ -75,6 +75,7 @@ serve = [
 dev = [
     "pytest",
     "pytest-asyncio",
+    "protobuf",
     "ruff"
 ]
 

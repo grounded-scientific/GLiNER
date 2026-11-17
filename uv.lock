@@ -1355,6 +1355,7 @@ training = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "protobuf" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
@@ -1390,6 +1391,7 @@ provides-extras = ["onnx", "gpu", "openvino", "tokenizers", "training", "stanza"
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "protobuf" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
