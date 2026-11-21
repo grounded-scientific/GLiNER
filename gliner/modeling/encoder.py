@@ -1,43 +1,30 @@
-import os
-import warnings
 from typing import Any, Dict, List, Tuple
 from pathlib import Path
 
 import torch
 from torch import nn
-from transformers import AutoModel, AutoConfig, DebertaV2Model, T5EncoderModel
+from transformers import AutoConfig
 from transformers.modeling_outputs import BaseModelOutput
 
-from ..utils import MissedPackageException, is_module_available
 from .layers import LayersFuser
 from ..infer_packing import InferencePackingConfig, unpack_spans, pack_requests
-
-# Check for optional dependencies
-IS_LLM2VEC = is_module_available("llm2vec")
-IS_PEFT = is_module_available("peft")
-IS_TURBOT5 = is_module_available("turbot5")
-IS_FLASHDEBERTA = is_module_available("flashdeberta")
-
-if IS_LLM2VEC:
-    from llm2vec.models import GemmaBiModel, LlamaBiModel, Qwen2BiModel, MistralBiModel
-
-    DECODER_MODEL_MAPPING = {
-        "MistralConfig": MistralBiModel,
-        "LlamaConfig": LlamaBiModel,
-        "GemmaConfig": GemmaBiModel,
-        "Qwen2Config": Qwen2BiModel,
-    }
-else:
-    DECODER_MODEL_MAPPING = {}
-
-if IS_TURBOT5:
-    from turbot5.model.modeling import T5EncoderModel as FlashT5EncoderModel
-
-if IS_FLASHDEBERTA:
-    from flashdeberta import FlashDebertaV2Model
-
-if IS_PEFT:
-    from peft import LoraConfig, get_peft_model
+from .encoder_backends import (  # noqa: F401  (IS_* flags and DECODER_MODEL_MAPPING are re-exported public names)
+    IS_PEFT,
+    IS_LLM2VEC,
+    IS_TURBOT5,
+    IS_FLASHDEBERTA,
+    DECODER_MODEL_MAPPING,
+    build_backbone,
+    apply_lora_adapter,
+)
+from .packed_attention import (
+    MaskInfo,
+    forward_t5,
+    model_dtype,
+    forward_deberta,
+    forward_modernbert,
+    prepare_pair_attention_masks,
+)
 
 
 class Transformer(nn.Module):
@@ -47,6 +34,11 @@ class Transformer(nn.Module):
     encoder-only (BERT, DeBERTa), encoder-decoder (T5), and decoder-only models
     (LLaMA, Mistral) with bidirectional adaptations. It handles model initialization,
     adapter loading, and specialized forward passes for different architectures.
+
+    Backbone selection and optional-dependency handling live in
+    :mod:`gliner.modeling.encoder_backends`; the packed-attention forward passes live in
+    :mod:`gliner.modeling.packed_attention`. The private ``_forward_*`` / ``_prepare_pair_attention_masks``
+    methods below are thin delegates kept so existing callers and test seams keep working.
 
     Attributes:
         model: The underlying transformer model instance.
@@ -82,71 +74,10 @@ class Transformer(nn.Module):
                 when needed for specific model types.
         """
         super().__init__()
-        if labels_encoder:
-            encoder_config = config.labels_encoder_config
-        else:
-            encoder_config = config.encoder_config
-        if encoder_config is None:
-            encoder_config = AutoConfig.from_pretrained(
-                model_name, cache_dir=cache_dir, local_files_only=local_files_only
-            )
-            if config.vocab_size != -1:
-                encoder_config.vocab_size = config.vocab_size
+        encoder_config = self._resolve_encoder_config(model_name, config, labels_encoder, cache_dir, local_files_only)
 
-        if config._attn_implementation is not None and not labels_encoder:
-            encoder_config._attn_implementation = config._attn_implementation
-
-        config_name = encoder_config.__class__.__name__
-
-        kwargs = {}
-        if config_name in DECODER_MODEL_MAPPING:
-            if not IS_LLM2VEC:
-                raise MissedPackageException(
-                    f"The llm2vec package must be installed to use this decoder model: {config_name}"
-                )
-            else:
-                ModelClass = DECODER_MODEL_MAPPING[config_name]
-            custom = True
-        elif config_name in {"T5Config", "MT5Config"}:
-            custom = True
-            turbot5_type = os.environ.get("TURBOT5_ATTN_TYPE", "basic")
-            if turbot5_type and IS_TURBOT5:
-                ModelClass = FlashT5EncoderModel
-                kwargs = {"attention_type": turbot5_type}
-                config.encoder_config.attention_type = turbot5_type
-            else:
-                ModelClass = T5EncoderModel
-        elif config_name in {"DebertaV2Config"}:
-            custom = True
-            if os.environ.get("USE_FLASHDEBERTA", "") and IS_FLASHDEBERTA:
-                ModelClass = FlashDebertaV2Model
-            else:
-                ModelClass = DebertaV2Model
-
-        else:
-            custom = False
-            ModelClass = AutoModel
-
-        if from_pretrained:
-            self.model = ModelClass.from_pretrained(
-                model_name, **kwargs, trust_remote_code=True, cache_dir=cache_dir, local_files_only=local_files_only
-            )
-        elif not custom:
-            self.model = ModelClass.from_config(encoder_config, trust_remote_code=True)
-        else:
-            self.model = ModelClass(encoder_config, **kwargs)
-
-        adapter_config_file = Path(model_name) / "adapter_config.json"
-
-        if adapter_config_file.exists():
-            if not IS_PEFT:
-                warnings.warn(
-                    "Adapter configs were detected, if you want to apply them you need to install peft package.",
-                    stacklevel=2,
-                )
-            else:
-                adapter_config = LoraConfig.from_pretrained(model_name, local_files_only=local_files_only)
-                self.model = get_peft_model(self.model, adapter_config)
+        self.model = build_backbone(model_name, encoder_config, config, from_pretrained, cache_dir, local_files_only)
+        self.model = apply_lora_adapter(self.model, model_name, local_files_only)
 
         if config.fuse_layers:
             self.layers_fuser = LayersFuser(encoder_config.num_hidden_layers, encoder_config.hidden_size)
@@ -157,6 +88,42 @@ class Transformer(nn.Module):
             config.encoder_config = encoder_config
 
         self.config = config
+
+    @staticmethod
+    def _resolve_encoder_config(
+        model_name: str,
+        config: Any,
+        labels_encoder: bool,
+        cache_dir: str | Path | None,
+        local_files_only: bool,
+    ) -> Any:
+        """Return the Hugging Face config for the text or labels encoder.
+
+        Uses ``config.labels_encoder_config`` / ``config.encoder_config`` when set, otherwise loads it
+        from ``model_name`` (applying ``config.vocab_size`` when it is not ``-1``). The text encoder also
+        inherits ``config._attn_implementation`` when that is set.
+
+        Args:
+            model_name: Name or path of the pretrained model.
+            config: GLiNER configuration object.
+            labels_encoder: Select the labels-encoder config instead of the text-encoder config.
+            cache_dir: Optional download cache directory.
+            local_files_only: Only use local or cached files.
+
+        Returns:
+            The resolved encoder config.
+        """
+        encoder_config = config.labels_encoder_config if labels_encoder else config.encoder_config
+        if encoder_config is None:
+            encoder_config = AutoConfig.from_pretrained(
+                model_name, cache_dir=cache_dir, local_files_only=local_files_only
+            )
+            if config.vocab_size != -1:
+                encoder_config.vocab_size = config.vocab_size
+
+        if config._attn_implementation is not None and not labels_encoder:
+            encoder_config._attn_implementation = config._attn_implementation
+        return encoder_config
 
     def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
         """Forward pass through the transformer model.
@@ -181,23 +148,8 @@ class Transformer(nn.Module):
         pair_attention_mask = kwargs.pop("pair_attention_mask", None)
         base_attention_mask = kwargs.pop("attention_mask", None)
         kwargs.pop("token_lengths", None)  # GLiNER-internal kwarg, not accepted by HF models
-        # Extract input_ids if present
-        args = list(args)
-        input_ids = kwargs.pop("input_ids", None)
-        if input_ids is None and args:
-            input_ids = args[0]
-            args = args[1:]
-        args = tuple(args)
-
-        # Set default kwargs
-        kwargs.setdefault("output_attentions", False)
-        kwargs.setdefault("return_dict", True)
-
-        # Handle output_hidden_states based on fuse_layers config
-        if self.config.fuse_layers:
-            kwargs["output_hidden_states"] = True
-        else:
-            kwargs.setdefault("output_hidden_states", False)
+        input_ids, args = self._split_input_ids(args, kwargs)
+        self._apply_output_defaults(kwargs)
 
         if pair_attention_mask is not None:
             mask_info = self._prepare_pair_attention_masks(
@@ -206,32 +158,7 @@ class Transformer(nn.Module):
                 input_ids,
                 kwargs.get("inputs_embeds"),
             )
-
-            model_kwargs = dict(kwargs)
-            model_name = self.model.__class__.__name__
-
-            if model_name in {"DebertaV2Model", "DebertaModel"}:
-                output = self._forward_deberta(
-                    input_ids=input_ids,
-                    model_kwargs=model_kwargs,
-                    mask_info=mask_info,
-                )
-            elif model_name == "ModernBertModel":
-                output = self._forward_modernbert(
-                    input_ids=input_ids,
-                    model_kwargs=model_kwargs,
-                    mask_info=mask_info,
-                )
-            elif model_name in {"T5EncoderModel", "MT5EncoderModel", "T5Model"}:
-                output = self._forward_t5(
-                    input_ids=input_ids,
-                    model_kwargs=model_kwargs,
-                    mask_info=mask_info,
-                )
-            else:
-                model_kwargs.pop("packing_config", None)
-                model_kwargs["attention_mask"] = mask_info["extended_mask"]
-                output = self.model(*args, **model_kwargs)
+            output = self._forward_packed(input_ids, args, dict(kwargs), mask_info)
         else:
             if base_attention_mask is not None:
                 kwargs["attention_mask"] = base_attention_mask
@@ -239,11 +166,71 @@ class Transformer(nn.Module):
 
         # Common logic for both paths
         if self.config.fuse_layers:
-            encoder_layer = self.layers_fuser(output.hidden_states)
-        else:
-            encoder_layer = output[0]
+            return self.layers_fuser(output.hidden_states)
+        return output[0]
 
-        return encoder_layer
+    @staticmethod
+    def _split_input_ids(args: tuple, kwargs: dict[str, Any]) -> tuple[torch.Tensor | None, tuple]:
+        """Extract ``input_ids`` from ``kwargs`` (preferred) or the first positional argument.
+
+        Args:
+            args: Positional arguments given to :meth:`forward`.
+            kwargs: Keyword arguments given to :meth:`forward`; ``input_ids`` is popped in place.
+
+        Returns:
+            ``(input_ids_or_None, remaining_positional_args)``.
+        """
+        input_ids = kwargs.pop("input_ids", None)
+        if input_ids is None and args:
+            return args[0], tuple(args[1:])
+        return input_ids, tuple(args)
+
+    def _apply_output_defaults(self, kwargs: dict[str, Any]) -> None:
+        """Set the ``output_*`` / ``return_dict`` defaults every backbone call relies on (in place).
+
+        ``output_hidden_states`` is forced on when layer fusion is enabled, because the fuser consumes all
+        hidden states.
+        """
+        kwargs.setdefault("output_attentions", False)
+        kwargs.setdefault("return_dict", True)
+        if self.config.fuse_layers:
+            kwargs["output_hidden_states"] = True
+        else:
+            kwargs.setdefault("output_hidden_states", False)
+
+    def _forward_packed(
+        self,
+        input_ids: torch.Tensor | None,
+        args: tuple,
+        model_kwargs: dict[str, Any],
+        mask_info: MaskInfo,
+    ) -> Any:
+        """Run the backbone on a packed batch, using the architecture-specific path when one exists.
+
+        DeBERTa, ModernBERT and T5 families have dedicated implementations. Any other backbone receives
+        the 4D additive mask as its ``attention_mask``.
+
+        Args:
+            input_ids: Input token IDs, or None when ``inputs_embeds`` is in ``model_kwargs``.
+            args: Remaining positional arguments for the generic fallback.
+            model_kwargs: Keyword arguments for the backbone (consumed by the dedicated paths).
+            mask_info: Masks from :meth:`_prepare_pair_attention_masks`.
+
+        Returns:
+            The backbone output (``BaseModelOutput`` or tuple).
+        """
+        model_name = self.model.__class__.__name__
+
+        if model_name in {"DebertaV2Model", "DebertaModel"}:
+            return self._forward_deberta(input_ids=input_ids, model_kwargs=model_kwargs, mask_info=mask_info)
+        if model_name == "ModernBertModel":
+            return self._forward_modernbert(input_ids=input_ids, model_kwargs=model_kwargs, mask_info=mask_info)
+        if model_name in {"T5EncoderModel", "MT5EncoderModel", "T5Model"}:
+            return self._forward_t5(input_ids=input_ids, model_kwargs=model_kwargs, mask_info=mask_info)
+
+        model_kwargs.pop("packing_config", None)
+        model_kwargs["attention_mask"] = mask_info["extended_mask"]
+        return self.model(*args, **model_kwargs)
 
     def _get_model_dtype(self) -> torch.dtype:
         """Gets the data type of the model parameters.
@@ -251,10 +238,7 @@ class Transformer(nn.Module):
         Returns:
             The dtype of the model's parameters, or torch.float32 if no parameters exist.
         """
-        try:
-            return next(self.model.parameters()).dtype
-        except StopIteration:
-            return torch.float32
+        return model_dtype(self.model)
 
     def _prepare_pair_attention_masks(
         self,
@@ -265,9 +249,8 @@ class Transformer(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Prepares attention masks for packed sequence processing.
 
-        Converts pair attention masks (which specify token-to-token visibility) into
-        various mask formats required by different transformer architectures. Ensures
-        diagonal elements are attended to and inactive tokens are properly masked.
+        Delegates to :func:`gliner.modeling.packed_attention.prepare_pair_attention_masks`, using the
+        backbone's parameter dtype for the additive mask.
 
         Args:
             pair_attention_mask: Pairwise attention mask of shape (batch_size, seq_len, seq_len)
@@ -277,60 +260,15 @@ class Transformer(nn.Module):
             inputs_embeds: Optional input embeddings for device detection.
 
         Returns:
-            Dictionary containing:
-                - token_mask: Per-token mask of shape (batch_size, seq_len).
-                - token_mask_bool: Boolean version of token_mask.
-                - extended_mask: 4D attention mask of shape (batch_size, 1, seq_len, seq_len)
-                    with -inf for masked positions.
-                - block_mask: Boolean 3D mask of shape (batch_size, seq_len, seq_len).
+            Dictionary with ``token_mask``, ``token_mask_bool``, ``extended_mask`` and ``block_mask``.
         """
-        device = pair_attention_mask.device
-        if input_ids is not None:
-            device = input_ids.device
-        elif inputs_embeds is not None:
-            device = inputs_embeds.device
-
-        pair_mask_bool = pair_attention_mask.to(device=device, dtype=torch.bool)
-
-        token_mask_bool = pair_mask_bool.any(dim=-1)
-        if attention_mask is not None:
-            token_mask_bool = token_mask_bool & attention_mask.to(device=device, dtype=torch.bool)
-
-        seq_len = pair_mask_bool.size(-1)
-        if seq_len:
-            identity = torch.eye(seq_len, device=device, dtype=torch.bool).unsqueeze(0)
-            token_diag = token_mask_bool.unsqueeze(-1)
-            pair_mask_bool = pair_mask_bool | (identity & token_diag)
-
-        active = token_mask_bool.unsqueeze(-1) & token_mask_bool.unsqueeze(-2)
-        pair_mask_bool = pair_mask_bool & active
-
-        if attention_mask is not None:
-            token_mask = token_mask_bool.to(attention_mask.dtype)
-        else:
-            token_mask = token_mask_bool.to(dtype=torch.float32)
-
-        mask_dtype = self._get_model_dtype()
-        neg_inf = torch.finfo(mask_dtype).min
-        extended_mask = (
-            torch.zeros(pair_mask_bool.shape, dtype=mask_dtype, device=device)
-            .masked_fill(~pair_mask_bool, neg_inf)
-            .unsqueeze(1)
+        return prepare_pair_attention_masks(
+            pair_attention_mask,
+            attention_mask,
+            input_ids,
+            inputs_embeds,
+            self._get_model_dtype(),
         )
-
-        inactive = ~token_mask_bool
-        if inactive.any():
-            extended_mask = extended_mask.masked_fill(
-                inactive.unsqueeze(1).unsqueeze(-1),
-                torch.tensor(0.0, dtype=mask_dtype, device=device),
-            )
-
-        return {
-            "token_mask": token_mask,
-            "token_mask_bool": token_mask_bool,
-            "extended_mask": extended_mask,
-            "block_mask": pair_mask_bool,
-        }
 
     def _forward_deberta(
         self,
@@ -340,97 +278,21 @@ class Transformer(nn.Module):
     ) -> BaseModelOutput:
         """Forward pass through DeBERTa models with packed attention support.
 
-        Handles the specific requirements of DeBERTa architecture including embeddings,
-        relative position encodings, and optional enhanced mask tuning (z_steps).
+        Delegates to :func:`gliner.modeling.packed_attention.forward_deberta`.
 
         Args:
             input_ids: Input token IDs of shape (batch_size, seq_len), or None if
                 inputs_embeds is provided.
-            model_kwargs: Dictionary of model-specific keyword arguments including
-                inputs_embeds, token_type_ids, position_ids, output_attentions,
-                output_hidden_states, and return_dict.
-            mask_info: Dictionary containing prepared attention masks from
-                _prepare_pair_attention_masks.
+            model_kwargs: Model keyword arguments (consumed in place).
+            mask_info: Masks from _prepare_pair_attention_masks.
 
         Returns:
-            BaseModelOutput containing:
-                - last_hidden_state: Final layer output of shape (batch_size, seq_len, hidden_size).
-                - hidden_states: Tuple of all layer outputs if requested.
-                - attentions: Tuple of attention weights if requested.
+            BaseModelOutput with last_hidden_state, hidden_states and attentions as requested.
 
         Raises:
             ValueError: If neither or both input_ids and inputs_embeds are provided.
         """
-        inputs_embeds = model_kwargs.pop("inputs_embeds", None)
-        token_type_ids = model_kwargs.pop("token_type_ids", None)
-        position_ids = model_kwargs.pop("position_ids", None)
-        output_attentions = model_kwargs.pop("output_attentions")
-        produce_hidden = model_kwargs.pop("output_hidden_states")
-        return_dict = model_kwargs.pop("return_dict")
-
-        if input_ids is None and inputs_embeds is None:
-            raise ValueError("Either input_ids or inputs_embeds must be provided for packed attention")
-        if input_ids is not None and inputs_embeds is not None:
-            raise ValueError("Cannot supply both input_ids and inputs_embeds")
-
-        if token_type_ids is None:
-            ref = inputs_embeds if inputs_embeds is not None else input_ids
-            shape = ref.size()[:-1] if inputs_embeds is not None else ref.size()
-            token_type_ids = torch.zeros(shape, dtype=torch.long, device=ref.device)
-
-        embedding_output = self.model.embeddings(
-            input_ids=input_ids,
-            token_type_ids=token_type_ids,
-            position_ids=position_ids,
-            mask=mask_info["token_mask"],
-            inputs_embeds=inputs_embeds,
-        )
-
-        encoder_outputs = self.model.encoder(
-            embedding_output,
-            mask_info["block_mask"],
-            output_hidden_states=True,
-            output_attentions=output_attentions,
-            return_dict=True,
-        )
-
-        encoded_layers = list(encoder_outputs.hidden_states)
-
-        if getattr(self.model, "z_steps", 0) > 1:
-            hidden_states = encoded_layers[-2]
-            layers = [self.model.encoder.layer[-1] for _ in range(self.model.z_steps)]
-            query_states = encoded_layers[-1]
-            rel_embeddings = self.model.encoder.get_rel_embedding()
-            attention_mask = self.model.encoder.get_attention_mask(mask_info["block_mask"])
-            rel_pos = self.model.encoder.get_rel_pos(embedding_output)
-            for layer in layers[1:]:
-                query_states = layer(
-                    hidden_states,
-                    attention_mask,
-                    output_attentions=False,
-                    query_states=query_states,
-                    relative_pos=rel_pos,
-                    rel_embeddings=rel_embeddings,
-                )
-                encoded_layers.append(query_states)
-
-        sequence_output = encoded_layers[-1]
-        hidden_states_tuple = tuple(encoded_layers) if produce_hidden else None
-        attentions = encoder_outputs.attentions if output_attentions else None
-
-        if not return_dict:
-            result = (sequence_output,)
-            if hidden_states_tuple is not None:
-                result += (hidden_states_tuple,)
-            if attentions is not None:
-                result += (attentions,)
-            return result
-
-        return BaseModelOutput(
-            last_hidden_state=sequence_output,
-            hidden_states=hidden_states_tuple,
-            attentions=attentions,
-        )
+        return forward_deberta(self.model, input_ids, model_kwargs, mask_info)
 
     def _forward_modernbert(
         self,
@@ -440,106 +302,21 @@ class Transformer(nn.Module):
     ) -> BaseModelOutput:
         """Forward pass through ModernBERT models with packed attention support.
 
-        Handles ModernBERT-specific features including global and sliding window
-        attention patterns, and temporarily switches to eager attention mode
-        when using packed attention masks.
+        Delegates to :func:`gliner.modeling.packed_attention.forward_modernbert`.
 
         Args:
             input_ids: Input token IDs of shape (batch_size, seq_len), or None if
                 inputs_embeds is provided.
-            model_kwargs: Dictionary of model-specific keyword arguments including
-                inputs_embeds, position_ids, indices, cu_seqlens, max_seqlen,
-                batch_size, seq_len, output_attentions, output_hidden_states, return_dict.
-            mask_info: Dictionary containing prepared attention masks from
-                _prepare_pair_attention_masks.
+            model_kwargs: Model keyword arguments (consumed in place).
+            mask_info: Masks from _prepare_pair_attention_masks.
 
         Returns:
-            BaseModelOutput containing:
-                - last_hidden_state: Final layer output of shape (batch_size, seq_len, hidden_size).
-                - hidden_states: Tuple of all layer outputs if requested.
-                - attentions: Tuple of attention weights if requested.
+            BaseModelOutput with last_hidden_state, hidden_states and attentions as requested.
 
         Raises:
             ValueError: If both or neither input_ids and inputs_embeds are provided.
         """
-        inputs_embeds = model_kwargs.pop("inputs_embeds", None)
-        position_ids = model_kwargs.pop("position_ids", None)
-        cu_seqlens = model_kwargs.pop("cu_seqlens", None)
-        max_seqlen = model_kwargs.pop("max_seqlen", None)
-        batch_size = model_kwargs.pop("batch_size", None)
-        seq_len = model_kwargs.pop("seq_len", None)
-        output_attentions = model_kwargs.pop("output_attentions")
-        output_hidden_states = model_kwargs.pop("output_hidden_states")
-        return_dict = model_kwargs.pop("return_dict")
-
-        if (input_ids is None) == (inputs_embeds is None):
-            raise ValueError("ModernBERT requires exactly one of input_ids or inputs_embeds")
-
-        token_mask_bool = mask_info["token_mask_bool"].to(torch.bool)
-        if batch_size is None or seq_len is None:
-            ref = inputs_embeds if inputs_embeds is not None else input_ids
-            batch_size, seq_len = ref.shape[:2]
-        device = input_ids.device if input_ids is not None else inputs_embeds.device
-
-        if position_ids is None:
-            position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
-
-        base_attention_mask = token_mask_bool
-
-        original_impl = self.model.config._attn_implementation
-        if original_impl == "flash_attention_2":
-            self.model.config._attn_implementation = "eager"
-
-        self.model._maybe_set_compile()
-
-        global_attention_mask, sliding_window_mask = self.model._update_attention_mask(
-            base_attention_mask,
-            output_attentions=output_attentions,
-        )
-
-        block = mask_info["block_mask"].unsqueeze(1)
-        neg_inf = torch.finfo(global_attention_mask.dtype).min
-        global_attention_mask = global_attention_mask.masked_fill(~block, neg_inf)
-        sliding_window_mask = sliding_window_mask.masked_fill(~block, neg_inf)
-
-        hidden_states = self.model.embeddings(input_ids=input_ids, inputs_embeds=inputs_embeds)
-
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attentions = () if output_attentions else None
-
-        for encoder_layer in self.model.layers:
-            if output_hidden_states:
-                all_hidden_states = (*all_hidden_states, hidden_states)
-
-            layer_outputs = encoder_layer(
-                hidden_states,
-                attention_mask=global_attention_mask,
-                sliding_window_mask=sliding_window_mask,
-                position_ids=position_ids,
-                cu_seqlens=cu_seqlens,
-                max_seqlen=max_seqlen,
-                output_attentions=output_attentions,
-            )
-            hidden_states = layer_outputs[0]
-            if output_attentions and len(layer_outputs) > 1:
-                all_self_attentions = (*all_self_attentions, layer_outputs[1])
-
-        if output_hidden_states:
-            all_hidden_states = (*all_hidden_states, hidden_states)
-
-        hidden_states = self.model.final_norm(hidden_states)
-
-        if original_impl == "flash_attention_2":
-            self.model.config._attn_implementation = original_impl
-
-        if not return_dict:
-            return tuple(v for v in [hidden_states, all_hidden_states, all_self_attentions] if v is not None)
-
-        return BaseModelOutput(
-            last_hidden_state=hidden_states,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
-        )
+        return forward_modernbert(self.model, input_ids, model_kwargs, mask_info)
 
     def _forward_t5(
         self,
@@ -549,129 +326,22 @@ class Transformer(nn.Module):
     ) -> BaseModelOutput:
         """Forward pass through T5 encoder models with packed attention support.
 
-        Handles T5/MT5-specific architecture requirements including relative position
-        bias and proper attention mask formatting for the encoder stack.
+        Delegates to :func:`gliner.modeling.packed_attention.forward_t5`.
 
         Args:
             input_ids: Input token IDs of shape (batch_size, seq_len), or None if
                 inputs_embeds is provided.
-            model_kwargs: Dictionary of model-specific keyword arguments including
-                input_ids (can override parameter), inputs_embeds, head_mask,
-                past_key_values, use_cache, output_attentions, output_hidden_states,
-                return_dict, cache_position.
-            mask_info: Dictionary containing prepared attention masks from
-                _prepare_pair_attention_masks.
+            model_kwargs: Model keyword arguments (consumed in place).
+            mask_info: Masks from _prepare_pair_attention_masks.
 
         Returns:
-            BaseModelOutput containing:
-                - last_hidden_state: Final layer output of shape (batch_size, seq_len, hidden_size).
-                - hidden_states: Tuple of all layer outputs if requested.
-                - attentions: Tuple of attention weights if requested.
+            BaseModelOutput with last_hidden_state, hidden_states and attentions as requested.
 
         Raises:
             ValueError: If neither input_ids nor inputs_embeds is provided, or if
                 unsupported kwargs are passed.
         """
-        stack = self.model.encoder
-
-        kw_input_ids = model_kwargs.pop("input_ids", None)
-        if input_ids is None or kw_input_ids is not None:
-            input_ids = kw_input_ids
-
-        inputs_embeds = model_kwargs.pop("inputs_embeds", None)
-        head_mask = model_kwargs.pop("head_mask", None)
-        past_key_values = model_kwargs.pop("past_key_values", None)
-        use_cache = model_kwargs.pop("use_cache", stack.config.use_cache)
-        output_attentions = model_kwargs.pop("output_attentions")
-        output_hidden_states = model_kwargs.pop("output_hidden_states")
-        return_dict = model_kwargs.pop("return_dict")
-        cache_position = model_kwargs.pop("cache_position", None)
-
-        if model_kwargs:
-            raise ValueError(f"Unsupported kwargs for T5 forward: {list(model_kwargs.keys())}")
-
-        if inputs_embeds is None:
-            if input_ids is None:
-                raise ValueError("Either input_ids or inputs_embeds must be provided")
-            inputs_embeds = stack.embed_tokens(input_ids)
-            input_shape = input_ids.size()
-        else:
-            input_shape = inputs_embeds.size()[:-1]
-
-        seq_length = input_shape[1]
-        device = inputs_embeds.device
-
-        if cache_position is None:
-            cache_position = torch.arange(seq_length, device=device)
-
-        block_mask = mask_info["block_mask"].to(device=device, dtype=torch.bool)
-
-        dtype = inputs_embeds.dtype
-        neg_inf = torch.finfo(dtype).min
-        causal_mask = torch.zeros(block_mask.shape, dtype=dtype, device=device)
-        causal_mask = causal_mask.masked_fill(~block_mask, neg_inf).unsqueeze(1)
-
-        head_mask = stack.get_head_mask(head_mask, stack.config.num_layers)
-
-        hidden_states = stack.dropout(inputs_embeds)
-
-        all_hidden_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
-        position_bias = None
-
-        for idx, layer_module in enumerate(stack.block):
-            if output_hidden_states:
-                all_hidden_states = (
-                    *all_hidden_states,
-                    hidden_states,
-                )
-
-            layer_head_mask = head_mask[idx] if head_mask is not None else None
-
-            layer_outputs = layer_module(
-                hidden_states,
-                attention_mask=causal_mask,
-                position_bias=position_bias,
-                encoder_hidden_states=None,
-                encoder_attention_mask=None,
-                encoder_decoder_position_bias=None,
-                layer_head_mask=layer_head_mask,
-                cross_attn_layer_head_mask=None,
-                past_key_values=None if not use_cache else past_key_values,
-                use_cache=False,
-                output_attentions=output_attentions,
-                return_dict=True,
-                cache_position=cache_position,
-            )
-
-            hidden_states = layer_outputs[0]
-            position_bias = layer_outputs[1]
-
-            if output_attentions:
-                all_attentions = (
-                    *all_attentions,
-                    layer_outputs[2],
-                )
-
-        hidden_states = stack.final_layer_norm(hidden_states)
-        hidden_states = stack.dropout(hidden_states)
-
-        if output_hidden_states:
-            all_hidden_states = (*all_hidden_states, hidden_states)
-
-        if not return_dict:
-            result = (hidden_states,)
-            if output_hidden_states:
-                result += (all_hidden_states,)
-            if output_attentions:
-                result += (all_attentions,)
-            return result
-
-        return BaseModelOutput(
-            last_hidden_state=hidden_states,
-            hidden_states=all_hidden_states,
-            attentions=all_attentions,
-        )
+        return forward_t5(self.model, input_ids, model_kwargs, mask_info)
 
 
 class Encoder(nn.Module):
